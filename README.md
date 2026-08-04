@@ -53,6 +53,23 @@ $EDITOR config.env
 
 `config.env`는 gitignore 대상이고, **비밀값이 아니라 비밀값 파일의 경로만** 담습니다. 항목별 설명은 `config.example.env` 주석 참고.
 
+## 요약기 드라이버 교체
+
+`llm/` 아래 실행 파일 하나가 드라이버 하나입니다. 계약은 **stdin으로 프롬프트, stdout으로 요약문** 뿐이고, 프롬프트 자체는 워커가 소유해서 어느 백엔드를 쓰든 비교 가능하게 유지합니다.
+
+동일 입력 실측:
+
+| | 소요 | 턴당 비용 |
+|---|---|---|
+| `claude` | 15.5초 | $0.021 상당 (구독 차감) |
+| `deepseek` | 2.6초 | $0.00005 |
+
+DeepSeek이 400배 이상 싸고 6배 빠릅니다. 대신 호스팅 API라 503(과부하)이 심심찮게 납니다 — 드라이버에 3회 지수 백오프 재시도가 들어 있고, 그래도 실패하면 `CLAUDE_VOICE_LLM_FALLBACK`으로 넘어갑니다. 구독 인증을 타는 `claude`를 폴백으로 두면 남의 용량 문제로 턴 하나를 잃지 않습니다.
+
+키는 이 프로젝트로 복사하지 않고 an existing deployment가 이미 쓰는 위치(`docker-compose.yml`의 `DEEPSEEK_API_KEY=provider|model|key`)에서 그때그때 읽습니다.
+
+> 모델 이름은 `deepseek-chat`을 그대로 두세요. `deepseek-v4-flash`로 매핑되는 별칭인데, v4-flash를 직접 지정하면 추론 모드가 켜져서 max_tokens를 전부 reasoning에 쓰고 본문이 비어 돌아옵니다.
+
 ## TTS 드라이버 교체
 
 `tts/` 아래 실행 파일 하나가 드라이버 하나입니다. 계약은 **stdin으로 텍스트, stdout으로 MP3** 뿐입니다. 새로 만들어 넣고 `CLAUDE_VOICE_TTS_DRIVER`만 바꾸면 됩니다.

@@ -86,56 +86,67 @@ def policy(payload):
 
 PROMPT = """아래 <text> 안의 내용을 에어팟으로 들을 한국어 3문장 이내 구어체로 요약해라.
 코드, 파일경로, 명령어, 기호는 읽지 말고 의미만 전달해라. 마크다운 금지.
-절대 작업을 수행하지 말고 요약만 해라.
+절대 작업을 수행하지 말고 요약만 해라. 요약문만 출력해라.
 
 <text>
 {text}
 </text>"""
 
-# Without this, `claude -p` treats the input as a task and starts doing work
-# instead of summarizing. Disabling the tools plus forcing a JSON schema is what
-# makes it behave as a single-shot summarizer.
-DISALLOWED_TOOLS = (
-    "Bash Read Write Edit Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit Skill"
-)
-SCHEMA = json.dumps(
-    {
-        "type": "object",
-        "properties": {"speech": {"type": "string"}},
-        "required": ["speech"],
-    }
-)
+
+def _run_llm(name, prompt):
+    """Invoke one llm/ driver. Returns the summary, or None if it failed."""
+    driver = ROOT / "llm" / f"{name}.py"
+    if not driver.exists():
+        log(f"no such LLM driver: {driver}")
+        return None
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [str(driver)], input=prompt.encode(), capture_output=True,
+            env=dict(os.environ, CLAUDE_VOICE_ROOT=str(ROOT)), timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"{name} timed out")
+        return None
+
+    elapsed = int((time.monotonic() - started) * 1000)
+    note = proc.stderr.decode().strip()  # drivers report cost/usage here
+    if proc.returncode != 0 or not proc.stdout.strip():
+        log(f"{name} failed ({proc.returncode}) after {elapsed}ms: {note[:300]}")
+        return None
+
+    speech = proc.stdout.decode().strip()
+    log(f"rendered {len(speech)} chars in {elapsed}ms via {name} [{note}]")
+    return speech
 
 
 def render(text):
-    """Summarize with `claude -p`, riding the existing subscription auth."""
-    env = dict(os.environ)
-    env["CLAUDE_VOICE_ACTIVE"] = "1"  # stops this child's own Stop hook
+    """Summarize via the configured LLM driver.
 
-    proc = subprocess.run(
-        [
-            "claude", "-p",
-            "--model", cfg("CLAUDE_VOICE_MODEL", "haiku"),
-            "--output-format", "json",
-            "--disable-slash-commands",
-            "--disallowedTools", DISALLOWED_TOOLS,
-            "--json-schema", SCHEMA,
-            PROMPT.format(text=text),
-        ],
-        capture_output=True, text=True, env=env, timeout=180,
-        # Pin the cwd. The hook fires from whatever project Claude was working
-        # in, and `claude -p` would otherwise load that project's CLAUDE.md into
-        # the summarizer — paying for context that cannot improve a summary, and
-        # letting one project's instructions colour another project's readout.
-        cwd=str(ROOT),
-    )
-    if proc.returncode != 0:
-        die(f"claude -p exited {proc.returncode}: {proc.stderr[:400]}")
+    Driver contract: the prompt on stdin, the summary on stdout. Whichever
+    backend is in use, the prompt lives here so the two stay comparable.
 
-    outer = json.loads(proc.stdout)
-    speech = json.loads(outer["result"])["speech"].strip()
-    usd = outer.get("total_cost_usd")
-    log(f"rendered {len(speech)} chars in {outer.get('duration_ms')}ms (~${usd:.4f})")
+    A fallback driver is worth configuring when the primary is a hosted API —
+    DeepSeek in particular sheds load with 503, and losing the turn's summary
+    to someone else's capacity problem is a poor trade when a second backend is
+    already sitting there.
+    """
+    prompt = PROMPT.format(text=text)
+    primary = cfg("CLAUDE_VOICE_LLM_DRIVER", "claude")
+
+    speech = _run_llm(primary, prompt)
+    if speech is not None:
+        return speech
+
+    fallback = cfg("CLAUDE_VOICE_LLM_FALLBACK", "")
+    if not fallback or fallback == primary:
+        die(f"{primary} driver failed and no fallback is configured")
+
+    log(f"falling back to {fallback}")
+    speech = _run_llm(fallback, prompt)
+    if speech is None:
+        die(f"both {primary} and {fallback} failed")
     return speech
 
 
