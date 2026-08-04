@@ -1,151 +1,160 @@
 # claude-voice
 
-Claude Code가 한 턴을 끝낼 때마다, 그 응답을 **귀로 듣기 좋은 한국어 3문장으로 요약해서 텔레그램 음성 메시지로** 보냅니다. 에어팟 끼고 일하면서 결과를 따라가려고 만들었습니다.
+Hear what Claude Code just did, and answer it out loud — without opening the laptop.
+
+Every time a Claude Code turn ends, its response is summarized into a few sentences written for the ear and pushed to Telegram. Reply there by voice and the session picks up where it left off.
 
 ```
-Stop 훅 ──> policy ──> render ──> synthesize ──> deliver
-           말할까?    귀용 요약    음성 합성      텔레그램
-                     claude -p    GCP TTS       sendVoice
+Claude Code turn ends
+   │
+   ├─ Stop hook ─> policy ─> render ─> synthesize ─> deliver ─> your phone
+   │               speak?    summary    audio        Telegram
+   │
+   └─ you reply by voice
+          │
+        listener ─> transcribe ─> claude -p --resume ─> (that turn's Stop hook)
 ```
 
-## 설계 메모
+The loop closes on itself: a resumed turn is a turn, so its answer comes back the same way.
 
-**네 단계는 일부러 분리해 뒀습니다.** 재사용 가치가 있는 건 TTS가 아니라 "턴이 끝났다는 이벤트를 잡아 임의의 채널로 내보내는 층"이기 때문입니다. 나중에 슬랙 알림이나 라디오 PWA를 붙일 때 갈아끼울 지점이 `bin/voice-worker.py`의 함수 네 개입니다.
+## Why it is built this way
 
-**훅은 즉시 종료합니다.** 요약+합성이 15초쯤 걸리는데, 훅 안에서 기다리면 매 턴이 그만큼 멈춥니다. `hooks/stop.sh`는 payload를 읽어 워커에게 넘기고 바로 `exit 0` 합니다.
+**Four stages, kept apart.** The reusable part is not text-to-speech — it is the layer that catches "a turn finished" and pushes it somewhere. Swapping the speech engine, the summarizer, or the sink should mean replacing one executable, not editing a pipeline. Each stage is a separate function, and two of them are separate processes with a one-line contract.
 
-**재귀 가드가 필요합니다.** 워커가 `claude -p`를 호출하면 그 자식 프로세스도 같은 사용자 레벨 훅 설정을 물려받습니다. 가드가 없으면 자기 요약을 무한히 요약합니다. `CLAUDE_VOICE_ACTIVE` 환경변수로 막습니다. (`--bare` 플래그가 훅을 통째로 끄지만, OAuth 구독 인증을 읽지 않아서 이 환경에서는 못 씁니다.)
+**The hook returns immediately.** Summarizing and synthesizing take around fifteen seconds. Doing that inside the hook would stall every turn by that much, so `hooks/stop.sh` reads the payload, hands it to a detached worker, and exits in about three milliseconds.
 
-**요약은 `claude -p`로 합니다.** API 키 없이 기존 구독 인증을 그대로 타는 게 장점입니다. 대신 그냥 호출하면 요약 대신 실제 작업을 시작해버리므로, 도구를 전부 끄고 `--json-schema`로 출력 형태를 강제해야 합니다. 매 호출 30k 토큰 컨텍스트가 붙어 턴당 $0.0116 상당(구독 사용량에서 차감)이 나갑니다. 아까워지면 Render 단만 Haiku 직접 호출로 교체하세요 — 같은 요약이 $0.0015입니다.
+**A recursion guard is not optional.** The worker shells out to Claude to write the summary, and that child process inherits the same user-level hook configuration. Without the `CLAUDE_VOICE_ACTIVE` guard it summarizes its own summaries forever. (`claude --bare` skips hooks entirely but never reads subscription OAuth, so it is not usable when there is no API key.)
 
-## 설치
+## Requirements
 
-```bash
+| | |
+|---|---|
+| OS | Linux or macOS. The hook, the worker and the listener are POSIX shell + Python 3.9+, no packages to install. |
+| Claude Code | Installed and authenticated, with `claude` on `PATH`. |
+| Binaries | `ffmpeg` (built with libopus), `curl`, `setsid`. Add `gcloud` for the bundled Google Cloud drivers. |
+| Telegram | A bot from [@BotFather](https://t.me/BotFather). Optionally a forum supergroup — see below. |
+| Speech | An account with whatever service the `tts/` and `stt/` drivers you pick need. |
+| Network | Outbound HTTPS to `api.telegram.org` and your speech provider. No inbound ports, no public endpoint. |
+
+The bundled drivers use Google Cloud Text-to-Speech and Speech-to-Text, which need a service-account key and both APIs enabled on the project:
+
+```sh
+gcloud services enable texttospeech.googleapis.com speech.googleapis.com --project <your-project>
+```
+
+Nothing about the design is Google-specific — see *Swapping drivers* below.
+
+> **The summarization prompt is written in Korean**, and the voice and speech-recognition defaults are `ko-KR`. Change the language in `config.env` and the prompt in the `PROMPT` constant at the top of `bin/voice-worker.py`.
+
+## Install
+
+```sh
+git clone https://github.com/YoungjuneKwon/claude-voice
+cd claude-voice
 cp config.example.env config.env
 $EDITOR config.env
 
-# 봇에게 아무 메시지나 한 번 보낸 뒤:
-./bin/find-chat-id.sh          # 출력된 줄을 config.env에 붙여넣기
+# Send your bot a message first — Telegram reveals a chat id only after that.
+./bin/find-chat-id.sh          # paste the printed line into config.env
 
-./bin/selftest.sh              # 훅 연결 전에 파이프라인 먼저 검증
-./install.sh                   # ~/.claude/settings.json에 Stop 훅 등록
+./bin/selftest.sh              # exercise the pipeline before wiring the hook up
+./install.sh                   # register the Stop hook in ~/.claude/settings.json
 ```
 
-되돌리려면 `./install.sh --remove`. 설정 파일은 수정 전에 `.bak`으로 백업됩니다.
+`./install.sh --remove` undoes it. Your settings file is backed up to `.bak` before it is touched. The hook is picked up by sessions started after installation.
 
-## 세션 분리 — 포럼 토픽
+To take spoken replies as well:
 
-세션 하나에 토픽 하나가 자동으로 생깁니다. 여러 세션을 동시에 돌리면 한 채팅방에 서로 무관한 요약이 교대로 쌓여 읽을 수 없게 되는데, 토픽이 이걸 갈라놓습니다.
-
-포럼 여부는 `getChat`으로 감지합니다. **일반 채팅이면 토픽 없이 그대로 동작**하므로 설정을 바꿀 필요는 없고, 그룹을 만들면 자동으로 넘어갑니다.
-
-설정 절차:
-
-1. 텔레그램에서 그룹 생성 → 봇 추가
-2. 봇을 **관리자**로 승격, **토픽 관리(Manage Topics)** 권한 부여
-3. 그룹 설정에서 **Topics** 켜기 (이때 슈퍼그룹으로 자동 전환되며 chat_id가 `-100...`으로 바뀝니다)
-4. `bin/find-chat-id.sh`로 새 ID를 찾아 `config.env`에 반영
-
-> 봇이 **관리자면 프라이버시 모드는 무시**됩니다. 일반 멤버 봇은 자기 앞으로 온 답장·멘션만 받아서 상행이 막히니, 관리자 승격은 선택이 아니라 필수입니다.
-
-세션↔토픽 매핑은 `state/topics.json`에 남습니다. 세션이 끝나도 토픽은 남으니, 쌓이면 텔레그램에서 직접 닫거나 지우면 됩니다.
-
-## 말로 회신하기 (상행)
-
-텔레그램에 음성으로 답장하면 그 세션이 이어집니다. 노트북을 열 필요가 없습니다.
-
-```
-폰에서 음성 회신 ──> listener ──> STT ──> claude -p --resume <session>
-                                              │
-                          그 턴의 Stop 훅 ─────┘──> 하행 파이프라인 ──> 폰
+```sh
+./bin/listen.sh start          # also: stop, status, tail
 ```
 
-```bash
-./bin/listen.sh start     # 롱폴링 데몬 (stop / status / tail)
-```
+## Configuration
 
-**어느 세션으로 갈지는 포럼 토픽으로 정합니다.** 토픽 안에서 말하면 그 토픽의 세션으로 갑니다 — 특정 메시지를 지목할 필요가 없습니다. 받아쓰기로 보내는 답장은 애초에 메시지를 지목하지 못하기 때문에 이게 중요합니다.
+`config.env` is gitignored and holds **paths to secrets, never secrets**. Every setting is documented inline in `config.example.env`.
 
-토픽이 없는 일반 채팅에서는 답장 지목(`state/routes.json`의 `message_id → session_id`)으로, 그것도 없으면 가장 최근 세션으로 떨어집니다.
+## Hands-free listening
 
-수신한 음성은 STT를 거친 뒤 **`🎙 <인식된 문장>` 형태로 되돌려 보냅니다.** 답이 이상할 때 STT 오인식 때문인지 아닌지 구분하려면 이게 필요합니다.
+Telegram will not auto-play an incoming voice note, so listening without a tap goes through iOS instead:
 
-### 권한
+**Settings → Notifications → Announce Notifications** → on → enable **Telegram**
 
-기본은 **읽기 전용**입니다 (`CLAUDE_VOICE_REPLY_DISALLOWED=Edit Write Bash NotebookEdit`).
+With AirPods in and the phone locked, Siri reads new notifications aloud. It reads the notification *body*, so a voice note announces only as "voice message" — `CLAUDE_VOICE_DELIVER_MODE` must include `text` for this to work.
 
-음성 지시는 기계가 받아쓴 문장이고, 아무도 안 보는 상태에서 실행됩니다. 확인 프롬프트를 띄워도 답할 사람이 없어 그냥 멈추기 때문에, 오인식이 파일을 바꾸는 경로를 아예 막아둡니다. 질문·상태 확인·분석은 그대로 됩니다.
-
-넓히려면 `config.env`에서 해당 값을 비우면 되지만, git으로 되돌릴 수 있는 저장소에서만 권합니다.
-
-### 알려진 한계
-
-**활성 세션을 동시에 이어받으면 충돌할 수 있습니다.** 리스너는 대상 세션이 지금 돌고 있는지 확인하지 않고 `--resume`합니다. 노트북을 닫아둔 상태(이 기능의 본래 용도)에서는 문제가 없지만, 인터랙티브 세션이 떠 있는 채로 회신하면 같은 대화 기록에 두 프로세스가 쓰게 됩니다.
-
-## 핸즈프리로 듣기
-
-텔레그램에는 수신 음성 자동 재생이 없습니다. 탭 없이 들으려면 iOS의 **알림 읽어주기**를 씁니다:
-
-**설정 → 알림 → 알림 알려주기** → 켬 → 목록에서 **Telegram** 켜기
-
-에어팟을 착용하고 **아이폰이 잠긴 상태**일 때, 도착한 알림 본문을 Siri가 읽어줍니다. 단 이건 텍스트를 읽는 기능이라 음성 메시지는 "음성 메시지"라고만 announce 됩니다 — 그래서 `CLAUDE_VOICE_DELIVER_MODE`에 `text`가 포함돼야 동작합니다.
-
-| 모드 | 탭 필요 | 목소리 | 소요 |
+| Mode | Tap to hear | Voice | Round trip |
 |---|---|---|---|
-| `text` | 없음 | Siri | ~13초 |
-| `voice` | 있음 | Chirp3-HD | ~22초 |
-| `both` | — | 둘 다 | ~22초 |
+| `text` | no | Siri | ~13s |
+| `voice` | yes | your TTS engine | ~22s |
+| `both` | — | both | ~22s |
 
-기본값 `both`로 두고 일주일 써본 뒤 하나로 줄이는 걸 권합니다. `text`로 정착하면 TTS 단계가 통째로 빠져서 GCP 의존성도 사라집니다.
+Settling on `text` drops the synthesis stage entirely, and with it the speech provider dependency.
 
-## 설정
+## One topic per session
 
-`config.env`는 gitignore 대상이고, **비밀값이 아니라 비밀값 파일의 경로만** 담습니다. 항목별 설명은 `config.example.env` 주석 참고.
+Several sessions sharing one chat read as a pile of unrelated messages. If the target chat is a forum supergroup, each session gets its own topic automatically.
 
-## 요약기 드라이버 교체
+1. Create a group, add the bot
+2. Promote the bot to **administrator** with **Manage Topics**
+3. Enable **Topics** in the group settings — this converts it to a supergroup and changes the chat id to a `-100…` form
+4. Re-run `bin/find-chat-id.sh` and update `config.env`
 
-`llm/` 아래 실행 파일 하나가 드라이버 하나입니다. 계약은 **stdin으로 프롬프트, stdout으로 요약문** 뿐이고, 프롬프트 자체는 워커가 소유해서 어느 백엔드를 쓰든 비교 가능하게 유지합니다.
+> Administrator is not optional. A bot that is only a member sees just replies and mentions under privacy mode, which silently breaks inbound replies. Being an admin makes privacy mode moot.
 
-동일 입력 실측:
+Forum support is detected via `getChat`, so a plain chat keeps working unchanged. The session-to-topic map lives in `state/topics.json`.
 
-| | 소요 | 턴당 비용 |
+## Replying by voice
+
+Speak into the topic and that session continues. Inside a topic no reply target is needed, which matters because a dictated message cannot point at one. Falling back, replying to a specific message names its session, and failing both the newest session is used.
+
+Transcripts are echoed back as `🎙 …` so a strange answer can be traced to a mishearing.
+
+### Reply permissions
+
+Replies are **read-only by default** (`CLAUDE_VOICE_REPLY_DISALLOWED="Edit Write Bash NotebookEdit"`).
+
+A spoken instruction is transcribed by a machine and acted on with nobody watching; a confirmation prompt would simply hang. A misheard word can waste a turn, but it cannot rewrite a file. Widen it only where git can undo the damage.
+
+### Known limitation
+
+The listener does not check whether the target session is currently running before resuming it. With the laptop closed — the case this is for — that is fine. Reply while an interactive session is live and two processes write to the same conversation.
+
+## Swapping drivers
+
+Three stages are separate executables with one-line contracts:
+
+| Directory | stdin | stdout |
 |---|---|---|
-| `claude` | 15.5초 | $0.021 상당 (구독 차감) |
-| `deepseek` | 2.6초 | $0.00005 |
+| `llm/` | the prompt | summary text |
+| `tts/` | text | MP3 bytes |
+| `stt/` | OGG/Opus audio | transcript text |
 
-DeepSeek이 400배 이상 싸고 6배 빠릅니다. 대신 호스팅 API라 503(과부하)이 심심찮게 납니다 — 드라이버에 3회 지수 백오프 재시도가 들어 있고, 그래도 실패하면 `CLAUDE_VOICE_LLM_FALLBACK`으로 넘어갑니다. 구독 인증을 타는 `claude`를 폴백으로 두면 남의 용량 문제로 턴 하나를 잃지 않습니다.
+Drop in an executable and point the matching `*_DRIVER` setting at its name. The prompt itself stays in the worker so backends stay comparable. Drivers read configuration from the environment, so to run one by hand:
 
-키는 이 프로젝트로 복사하지 않고 an existing deployment가 이미 쓰는 위치(`docker-compose.yml`의 `DEEPSEEK_API_KEY=provider|model|key`)에서 그때그때 읽습니다.
-
-> 모델 이름은 `deepseek-chat`을 그대로 두세요. `deepseek-v4-flash`로 매핑되는 별칭인데, v4-flash를 직접 지정하면 추론 모드가 켜져서 max_tokens를 전부 reasoning에 쓰고 본문이 비어 돌아옵니다.
-
-## TTS 드라이버 교체
-
-`tts/` 아래 실행 파일 하나가 드라이버 하나입니다. 계약은 **stdin으로 텍스트, stdout으로 MP3** 뿐입니다. 새로 만들어 넣고 `CLAUDE_VOICE_TTS_DRIVER`만 바꾸면 됩니다.
-
-현재 `gcp` 드라이버 하나. 서비스 계정으로 인증하되 gcloud 자격증명 캐시를 `state/gcloud`에 격리해서, 평소 쓰는 gcloud 계정 설정을 건드리지 않습니다.
-
-드라이버는 설정 파일을 읽지 않고 환경변수만 봅니다. 손으로 돌려볼 때는 config를 먼저 실어주세요:
-
-```bash
+```sh
 set -a; . ./config.env; set +a
-echo "테스트 문장입니다." | ./tts/gcp.py > /tmp/check.mp3
+echo "hello" | ./tts/gcp.py > /tmp/check.mp3
 ```
 
-기본 속도(`CLAUDE_VOICE_TTS_RATE=1.0`)는 흘려듣기엔 느립니다. 1.3 정도가 적당하고, 텔레그램 음성 메시지 자체에도 배속 버튼이 있으니 둘을 같이 쓰면 됩니다.
+Measured on identical input, the two bundled summarizers differ sharply:
 
-## 로그
+| | Latency | Cost per turn |
+|---|---|---|
+| `claude` | 15.5s | ~$0.021 equivalent, drawn from the subscription |
+| `deepseek` | 2.6s | ~$0.00005 |
 
-```bash
-tail -f state/worker.log
+DeepSeek is dramatically cheaper and faster, but it is a hosted API that sheds load with 503s. The driver retries three times with backoff; past that, `CLAUDE_VOICE_LLM_FALLBACK` hands the turn to another driver so someone else's capacity problem does not cost you a summary.
+
+## Logs
+
+```sh
+tail -f state/worker.log      # outbound: one line per stage, with timing and cost
+tail -f state/listener.log    # inbound: routing decisions
 ```
 
-단계별 소요 시간과 비용이 한 줄씩 찍힙니다.
+## Status
 
-## 현재 상태 (v0)
+Early. It works end to end and is in daily use, but the policy stage is deliberately naive — a single length threshold — because which turns are worth hearing only becomes clear after living with it. Quiet hours, per-session mute, and filtering out bare acknowledgements belong there once there is evidence for their shape.
 
-목적은 기능 완성이 아니라 **"일주일 실제로 듣는가"** 검증 하나입니다. 그래서:
+## License
 
-- policy는 글자 수 하나로만 판단합니다. 무음 시간, 세션별 on/off는 실제로 안 듣게 되는 이유를 확인한 뒤에 붙입니다.
-- 세션 여러 개를 동시에 돌리면 음성이 한 채팅방에 섞입니다. 캡션에 프로젝트 이름이 붙긴 하지만, 분리하려면 텔레그램 포럼 토픽이 필요합니다.
-- 상행(음성 답장 → 세션 주입)은 아직 없습니다. 플러그인 `monitors/`로 붙일 계획입니다.
+MIT — see [LICENSE](LICENSE).

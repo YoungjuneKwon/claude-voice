@@ -9,10 +9,14 @@ Unlike the claude driver this is a plain one-shot completion — there is no
 agent loop to talk out of doing the task, so no tool-disabling or forced schema
 is needed. It does need an API key.
 
-The key is read from wherever it already lives rather than copied into this
-project's config. an existing deployment stores it as a pipe-joined triple:
+The key can be given directly, or read from a file that already holds it so it
+is not duplicated into this project's config. Both shapes are accepted:
 
+    DEEPSEEK_API_KEY=sk-...
     DEEPSEEK_API_KEY=deepseek|deepseek-chat|sk-...
+
+The second is the `provider|model|key` triple some deployments store, and the
+model name in it is used unless overridden.
 """
 
 import json
@@ -53,11 +57,14 @@ def credentials():
     if not match:
         sys.exit(f"deepseek: no {var} in {path}")
 
-    parts = match.group(1).split("|")
-    if len(parts) != 3:
-        sys.exit(f"deepseek: expected provider|model|key in {var}, got {len(parts)} field(s)")
-    _provider, found_model, found_key = parts
-    return model or found_model, found_key
+    value = match.group(1)
+    if "|" in value:
+        parts = value.split("|")
+        if len(parts) != 3:
+            sys.exit(f"deepseek: expected provider|model|key in {var}, got {len(parts)} fields")
+        _provider, found_model, found_key = parts
+        return model or found_model, found_key
+    return model or "deepseek-chat", value
 
 
 def main():
