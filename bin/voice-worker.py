@@ -123,6 +123,11 @@ def render(text):
             PROMPT.format(text=text),
         ],
         capture_output=True, text=True, env=env, timeout=180,
+        # Pin the cwd. The hook fires from whatever project Claude was working
+        # in, and `claude -p` would otherwise load that project's CLAUDE.md into
+        # the summarizer — paying for context that cannot improve a summary, and
+        # letting one project's instructions colour another project's readout.
+        cwd=str(ROOT),
     )
     if proc.returncode != 0:
         die(f"claude -p exited {proc.returncode}: {proc.stderr[:400]}")
