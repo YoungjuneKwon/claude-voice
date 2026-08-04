@@ -37,7 +37,9 @@ def load_config():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
+        # Values may be quoted so the file stays safe to `source` from shell,
+        # where an unquoted space would end the assignment and run the rest.
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
 def cfg(key, default=None, required=False):
@@ -263,6 +265,56 @@ def _telegram(method, body, content_type):
     return result["result"]
 
 
+def topic_for(payload, label):
+    """Return the forum topic this session should post into, or None.
+
+    One chat carrying several sessions reads as a pile of unrelated messages.
+    A forum topic per session separates them, and gives the inbound side an
+    unambiguous routing key: anything said inside a topic belongs to that
+    session, with no need to reply to a specific message.
+
+    Returns None for a plain chat, which keeps working exactly as before.
+    """
+    chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
+    session_id = payload.get("session_id")
+    if not session_id:
+        return None
+
+    chat = _telegram("getChat", json.dumps({"chat_id": chat_id}).encode(),
+                     "application/json")
+    if not chat.get("is_forum"):
+        return None
+
+    topics_file = Path(cfg("CLAUDE_VOICE_STATE", str(ROOT / "state"))) / "topics.json"
+    topics = {}
+    if topics_file.exists():
+        try:
+            topics = json.loads(topics_file.read_text())
+        except json.JSONDecodeError:
+            log("topics.json was unreadable; starting a fresh one")
+
+    known = topics.get(session_id)
+    if known:
+        return known["thread_id"]
+
+    created = _telegram(
+        "createForumTopic",
+        json.dumps({"chat_id": chat_id, "name": label}).encode(),
+        "application/json",
+    )
+    topics[session_id] = {
+        "thread_id": created["message_thread_id"],
+        "label": label,
+        "cwd": payload.get("cwd"),
+        "transcript_path": payload.get("transcript_path"),
+        "at": time.time(),
+    }
+    topics_file.parent.mkdir(parents=True, exist_ok=True)
+    topics_file.write_text(json.dumps(topics, indent=2))
+    log(f"created topic '{label}' (thread {created['message_thread_id']})")
+    return created["message_thread_id"]
+
+
 def record_route(message_id, payload):
     """Remember which session a delivered message came from.
 
@@ -297,7 +349,7 @@ def record_route(message_id, payload):
     routes_file.write_text(json.dumps(routes, indent=2))
 
 
-def deliver_text(text):
+def deliver_text(text, thread_id=None):
     """Send the summary as a plain message.
 
     This is what makes it hands-free. iOS "Announce Notifications" reads a
@@ -306,19 +358,22 @@ def deliver_text(text):
     tradeoff is Siri's voice instead of the one we synthesized.
     """
     chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
-    body = json.dumps({"chat_id": chat_id, "text": text}).encode()
-    sent = _telegram("sendMessage", body, "application/json")
+    params = {"chat_id": chat_id, "text": text}
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    sent = _telegram("sendMessage", json.dumps(params).encode(), "application/json")
     log("delivered: text")
     return sent["message_id"]
 
 
-def deliver_voice(ogg, caption):
+def deliver_voice(ogg, caption, thread_id=None):
     """Send the synthesized audio as a voice note. Needs a tap to play, but
     keeps our voice and Telegram's playback-speed control."""
     chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
-    body, content_type = _multipart(
-        {"chat_id": chat_id, "caption": caption}, {"voice": ogg}
-    )
+    fields = {"chat_id": chat_id, "caption": caption}
+    if thread_id:
+        fields["message_thread_id"] = thread_id
+    body, content_type = _multipart(fields, {"voice": ogg})
     sent = _telegram("sendVoice", body, content_type)
     log("delivered: voice")
     return sent["message_id"]
@@ -340,19 +395,22 @@ def main():
 
     speech = render(text)
     mode = cfg("CLAUDE_VOICE_DELIVER_MODE", "both")
+    thread_id = topic_for(payload, project)
+
+    # In a forum the topic name already says which session this is; repeating
+    # it would only pad what Siri reads out.
+    spoken = speech if thread_id else f"{project}. {speech}"
 
     if mode in ("text", "both"):
         # No brackets or markup — Siri reads this string out loud verbatim.
-        record_route(deliver_text(f"{project}. {speech}"), payload)
+        record_route(deliver_text(spoken, thread_id), payload)
 
     if mode in ("voice", "both"):
         state = Path(cfg("CLAUDE_VOICE_STATE", str(ROOT / "state")))
         workdir = state / "audio" / f"{int(time.time())}-{session}"
         workdir.mkdir(parents=True, exist_ok=True)
         ogg = synthesize(speech, workdir)
-        # Caption, not brackets: Siri announces this string, so it has to read
-        # as a sentence rather than as markup.
-        record_route(deliver_voice(ogg, f"{project}. {speech[:900]}"), payload)
+        record_route(deliver_voice(ogg, spoken[:900], thread_id), payload)
 
 
 if __name__ == "__main__":

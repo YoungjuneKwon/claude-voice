@@ -49,7 +49,8 @@ def load_config():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
+        # Values may be quoted so the file stays safe to `source` from shell.
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
 def cfg(key, default=None, required=False):
@@ -108,13 +109,40 @@ def write_offset(value):
     (state_dir() / "listener-offset").write_text(str(value))
 
 
+def resolve_by_topic(message):
+    """Resolve the session from the forum topic the message was posted in.
+
+    This is the good path: a topic belongs to exactly one session, so anything
+    said inside it is unambiguous — no reply-to needed, which matters because
+    a dictated reply rarely targets a specific message.
+    """
+    thread_id = message.get("message_thread_id")
+    if thread_id is None:
+        return None
+    topics_file = state_dir() / "topics.json"
+    if not topics_file.exists():
+        return None
+    try:
+        topics = json.loads(topics_file.read_text())
+    except json.JSONDecodeError:
+        return None
+    for session_id, entry in topics.items():
+        if entry.get("thread_id") == thread_id:
+            return {**entry, "session_id": session_id}
+    log(f"message in unknown topic {thread_id}")
+    return None
+
+
 def resolve_session(message):
     """Find the session a reply belongs to.
 
-    Replying to a specific message in Telegram is the natural way to say which
-    conversation you mean, and it is the only thing that keeps two concurrent
-    projects apart. With no reply target, the newest session is the best guess.
+    Prefer the forum topic. Falling back: replying to a specific message names
+    a session too, and failing both, the newest session is the best guess.
     """
+    by_topic = resolve_by_topic(message)
+    if by_topic:
+        return by_topic
+
     routes_file = state_dir() / "routes.json"
     if not routes_file.exists():
         return None
@@ -213,16 +241,26 @@ def handle(message):
         log(f"ignoring message from unknown chat {chat_id}")
         return
 
+    # Answer inside the topic the question was asked in, or the thread falls
+    # out of its session and lands in General.
+    thread = message.get("message_thread_id")
+
+    def say(text):
+        params = {"chat_id": chat_id, "text": text}
+        if thread is not None:
+            params["message_thread_id"] = thread
+        api("sendMessage", **params)
+
     if "voice" in message:
         audio = download(message["voice"]["file_id"])
         text = transcribe(audio)
         if not text:
-            api("sendMessage", chat_id=chat_id, text="못 알아들었어요. 다시 말씀해 주세요.")
+            say("못 알아들었어요. 다시 말씀해 주세요.")
             return
         # Echo the transcript back. STT gets things wrong, and seeing what was
-        # heard is the only way to know whether a odd answer came from a
+        # heard is the only way to know whether an odd answer came from a
         # misheard instruction.
-        api("sendMessage", chat_id=chat_id, text=f"🎙 {text}")
+        say(f"🎙 {text}")
     elif "text" in message:
         text = message["text"].strip()
         if text.startswith("/"):
@@ -232,12 +270,11 @@ def handle(message):
 
     route = resolve_session(message)
     if not route:
-        api("sendMessage", chat_id=chat_id,
-            text="이어갈 세션이 없어요. 먼저 클로드에서 작업을 한 번 돌려주세요.")
+        say("이어갈 세션이 없어요. 먼저 클로드에서 작업을 한 번 돌려주세요.")
         return
 
     if not resume(route, text):
-        api("sendMessage", chat_id=chat_id, text="세션을 이어받지 못했어요.")
+        say("세션을 이어받지 못했어요.")
 
 
 # --- main -------------------------------------------------------------------
