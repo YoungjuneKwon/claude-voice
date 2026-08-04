@@ -206,22 +206,41 @@ def _multipart(fields, files):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def deliver(ogg, caption):
+def _telegram(method, body, content_type):
     token = telegram_token()
-    chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
-
-    body, content_type = _multipart(
-        {"chat_id": chat_id, "caption": caption}, {"voice": ogg}
-    )
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendVoice",
+        f"https://api.telegram.org/bot{token}/{method}",
         data=body, headers={"Content-Type": content_type},
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         result = json.load(resp)
     if not result.get("ok"):
-        die(f"telegram rejected the upload: {result}")
-    log("delivered")
+        die(f"telegram rejected {method}: {result}")
+
+
+def deliver_text(text):
+    """Send the summary as a plain message.
+
+    This is what makes it hands-free. iOS "Announce Notifications" reads a
+    notification's body aloud over AirPods while the phone is locked — but it
+    reads *text*, so a voice note only ever announces as "voice message". The
+    tradeoff is Siri's voice instead of the one we synthesized.
+    """
+    chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
+    body = json.dumps({"chat_id": chat_id, "text": text}).encode()
+    _telegram("sendMessage", body, "application/json")
+    log("delivered: text")
+
+
+def deliver_voice(ogg, caption):
+    """Send the synthesized audio as a voice note. Needs a tap to play, but
+    keeps our voice and Telegram's playback-speed control."""
+    chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
+    body, content_type = _multipart(
+        {"chat_id": chat_id, "caption": caption}, {"voice": ogg}
+    )
+    _telegram("sendVoice", body, content_type)
+    log("delivered: voice")
 
 
 # --- main -------------------------------------------------------------------
@@ -238,13 +257,18 @@ def main():
     if text is None:
         return
 
-    state = Path(cfg("CLAUDE_VOICE_STATE", str(ROOT / "state")))
-    workdir = state / "audio" / f"{int(time.time())}-{session}"
-    workdir.mkdir(parents=True, exist_ok=True)
-
     speech = render(text)
-    ogg = synthesize(speech, workdir)
-    deliver(ogg, f"[{project}] {speech[:900]}")
+    mode = cfg("CLAUDE_VOICE_DELIVER_MODE", "both")
+
+    if mode in ("text", "both"):
+        # No brackets or markup — Siri reads this string out loud verbatim.
+        deliver_text(f"{project}. {speech}")
+
+    if mode in ("voice", "both"):
+        state = Path(cfg("CLAUDE_VOICE_STATE", str(ROOT / "state")))
+        workdir = state / "audio" / f"{int(time.time())}-{session}"
+        workdir.mkdir(parents=True, exist_ok=True)
+        deliver_voice(synthesize(speech, workdir), f"[{project}] {speech[:900]}")
 
 
 if __name__ == "__main__":
