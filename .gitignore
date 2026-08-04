@@ -1,0 +1,7 @@
+# Local config points at secrets on this machine — never commit it.
+config.env
+
+# Runtime state (audio scratch, gcloud creds cache, logs)
+state/
+*.log
+__pycache__/
