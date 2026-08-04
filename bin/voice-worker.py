@@ -121,6 +121,39 @@ def _run_llm(name, prompt):
     return speech
 
 
+def project_label(payload):
+    """A stable name for the session this turn belongs to.
+
+    The payload's `cwd` is wherever the session happened to be when the turn
+    ended, and it drifts as work moves between directories — one conversation
+    reported itself as design, frontend, proveri and react-stats-ui across a
+    single afternoon. In a chat that carries several sessions at once, that
+    reads as unrelated conversations piling up.
+
+    The transcript's first entry has the directory the session was registered
+    under, which stays put for the session's life. That alone is not enough
+    though — several sessions typically start in the same directory, so a short
+    session tag comes along to keep them apart in a shared chat.
+    """
+    directory = None
+    transcript = payload.get("transcript_path")
+    if transcript and Path(transcript).exists():
+        try:
+            with open(transcript) as handle:
+                for line in handle:
+                    entry = json.loads(line)
+                    if entry.get("cwd"):
+                        directory = Path(entry["cwd"]).name
+                        break
+        except (json.JSONDecodeError, OSError):
+            pass
+    if not directory:
+        directory = Path(payload.get("cwd") or ".").name
+
+    tag = (payload.get("session_id") or "")[:4]
+    return f"{directory}-{tag}" if tag else directory
+
+
 def render(text):
     """Summarize via the configured LLM driver.
 
@@ -298,7 +331,7 @@ def main():
     payload = json.load(sys.stdin)
 
     session = (payload.get("session_id") or "unknown")[:8]
-    project = Path(payload.get("cwd") or ".").name
+    project = project_label(payload)
     log(f"--- turn from {project}/{session} ---")
 
     text = policy(payload)
