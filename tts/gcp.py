@@ -61,6 +61,7 @@ def main():
     key_file = need("CLAUDE_VOICE_GCP_KEY")
     project = need("CLAUDE_VOICE_GCP_PROJECT")
     voice = os.environ.get("CLAUDE_VOICE_TTS_VOICE", "ko-KR-Chirp3-HD-Aoede")
+    rate = float(os.environ.get("CLAUDE_VOICE_TTS_RATE", "1.0"))
     state = Path(os.environ.get("CLAUDE_VOICE_STATE", "state"))
 
     token = access_token(key_file, state / "gcloud")
@@ -69,7 +70,7 @@ def main():
         "input": {"text": text},
         # "ko-KR-Chirp3-HD-Aoede" -> language code "ko-KR"
         "voice": {"languageCode": "-".join(voice.split("-")[:2]), "name": voice},
-        "audioConfig": {"audioEncoding": "MP3"},
+        "audioConfig": {"audioEncoding": "MP3", "speakingRate": rate},
     }).encode()
 
     req = urllib.request.Request(ENDPOINT, data=body, headers={

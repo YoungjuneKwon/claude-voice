@@ -43,6 +43,15 @@ $EDITOR config.env
 
 현재 `gcp` 드라이버 하나. 서비스 계정으로 인증하되 gcloud 자격증명 캐시를 `state/gcloud`에 격리해서, 평소 쓰는 gcloud 계정 설정을 건드리지 않습니다.
 
+드라이버는 설정 파일을 읽지 않고 환경변수만 봅니다. 손으로 돌려볼 때는 config를 먼저 실어주세요:
+
+```bash
+set -a; . ./config.env; set +a
+echo "테스트 문장입니다." | ./tts/gcp.py > /tmp/check.mp3
+```
+
+기본 속도(`CLAUDE_VOICE_TTS_RATE=1.0`)는 흘려듣기엔 느립니다. 1.3 정도가 적당하고, 텔레그램 음성 메시지 자체에도 배속 버튼이 있으니 둘을 같이 쓰면 됩니다.
+
 ## 로그
 
 ```bash
