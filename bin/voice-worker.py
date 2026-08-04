@@ -249,6 +249,11 @@ def record_route(message_id, payload):
     routes[str(message_id)] = {
         "session_id": payload.get("session_id"),
         "cwd": payload.get("cwd"),
+        # `cwd` above is wherever the session happened to be when the turn
+        # ended, which drifts as work moves between directories. Resuming needs
+        # the directory the session was *registered* under, and the transcript
+        # is the only record of that — see resolve_project_dir in listener.py.
+        "transcript_path": payload.get("transcript_path"),
         "at": time.time(),
     }
     # Keep the file bounded; old messages are not worth replying to anyway.
@@ -312,7 +317,9 @@ def main():
         workdir = state / "audio" / f"{int(time.time())}-{session}"
         workdir.mkdir(parents=True, exist_ok=True)
         ogg = synthesize(speech, workdir)
-        record_route(deliver_voice(ogg, f"[{project}] {speech[:900]}"), payload)
+        # Caption, not brackets: Siri announces this string, so it has to read
+        # as a sentence rather than as markup.
+        record_route(deliver_voice(ogg, f"{project}. {speech[:900]}"), payload)
 
 
 if __name__ == "__main__":

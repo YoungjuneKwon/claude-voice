@@ -148,6 +148,31 @@ def transcribe(audio):
     return proc.stdout.decode().strip()
 
 
+def resolve_project_dir(route):
+    """Find the directory `claude --resume` must run from.
+
+    Sessions are stored per project directory, and --resume only looks inside
+    the one derived from the current cwd. The cwd recorded with the route is
+    whatever directory the session was in when the turn ended, which drifts as
+    work moves around — resume it from there and Claude reports "No conversation
+    found" even though the session exists.
+
+    The transcript's first entry carries the cwd the session was registered
+    under, which is the one that actually resolves.
+    """
+    transcript = route.get("transcript_path")
+    if transcript and Path(transcript).exists():
+        try:
+            with open(transcript) as handle:
+                for line in handle:
+                    entry = json.loads(line)
+                    if entry.get("cwd"):
+                        return entry["cwd"]
+        except (json.JSONDecodeError, OSError) as exc:
+            log(f"could not read cwd from transcript: {exc}")
+    return route.get("cwd")
+
+
 def resume(route, text):
     """Continue the session in a detached process.
 
@@ -168,9 +193,9 @@ def resume(route, text):
         cmd += ["--disallowedTools", denied]
     cmd += ["--resume", session_id, text]
 
-    cwd = route.get("cwd") or str(ROOT)
+    cwd = resolve_project_dir(route) or str(ROOT)
     if not Path(cwd).is_dir():
-        log(f"recorded cwd {cwd} is gone; running from {ROOT}")
+        log(f"project dir {cwd} is gone; running from {ROOT}")
         cwd = str(ROOT)
 
     log(f"resuming {session_id[:8]} in {Path(cwd).name}: {text[:60]}")
