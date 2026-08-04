@@ -227,6 +227,36 @@ def _telegram(method, body, content_type):
         result = json.load(resp)
     if not result.get("ok"):
         die(f"telegram rejected {method}: {result}")
+    return result["result"]
+
+
+def record_route(message_id, payload):
+    """Remember which session a delivered message came from.
+
+    This is what lets a spoken reply land in the right conversation: replying
+    to a message in Telegram carries its message_id back, and the listener
+    resolves that to the session to resume. Without it every reply would have
+    to guess, which breaks the moment two projects are running.
+    """
+    routes_file = Path(cfg("CLAUDE_VOICE_STATE", str(ROOT / "state"))) / "routes.json"
+    routes = {}
+    if routes_file.exists():
+        try:
+            routes = json.loads(routes_file.read_text())
+        except json.JSONDecodeError:
+            log("routes.json was unreadable; starting a fresh one")
+
+    routes[str(message_id)] = {
+        "session_id": payload.get("session_id"),
+        "cwd": payload.get("cwd"),
+        "at": time.time(),
+    }
+    # Keep the file bounded; old messages are not worth replying to anyway.
+    for stale in sorted(routes, key=lambda k: routes[k]["at"])[:-200]:
+        routes.pop(stale)
+
+    routes_file.parent.mkdir(parents=True, exist_ok=True)
+    routes_file.write_text(json.dumps(routes, indent=2))
 
 
 def deliver_text(text):
@@ -239,8 +269,9 @@ def deliver_text(text):
     """
     chat_id = cfg("CLAUDE_VOICE_TELEGRAM_CHAT_ID", required=True)
     body = json.dumps({"chat_id": chat_id, "text": text}).encode()
-    _telegram("sendMessage", body, "application/json")
+    sent = _telegram("sendMessage", body, "application/json")
     log("delivered: text")
+    return sent["message_id"]
 
 
 def deliver_voice(ogg, caption):
@@ -250,8 +281,9 @@ def deliver_voice(ogg, caption):
     body, content_type = _multipart(
         {"chat_id": chat_id, "caption": caption}, {"voice": ogg}
     )
-    _telegram("sendVoice", body, content_type)
+    sent = _telegram("sendVoice", body, content_type)
     log("delivered: voice")
+    return sent["message_id"]
 
 
 # --- main -------------------------------------------------------------------
@@ -273,13 +305,14 @@ def main():
 
     if mode in ("text", "both"):
         # No brackets or markup — Siri reads this string out loud verbatim.
-        deliver_text(f"{project}. {speech}")
+        record_route(deliver_text(f"{project}. {speech}"), payload)
 
     if mode in ("voice", "both"):
         state = Path(cfg("CLAUDE_VOICE_STATE", str(ROOT / "state")))
         workdir = state / "audio" / f"{int(time.time())}-{session}"
         workdir.mkdir(parents=True, exist_ok=True)
-        deliver_voice(synthesize(speech, workdir), f"[{project}] {speech[:900]}")
+        ogg = synthesize(speech, workdir)
+        record_route(deliver_voice(ogg, f"[{project}] {speech[:900]}"), payload)
 
 
 if __name__ == "__main__":
