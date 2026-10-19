@@ -118,6 +118,30 @@ A spoken instruction is transcribed by a machine and acted on with nobody watchi
 
 The listener does not check whether the target session is currently running before resuming it. With the laptop closed — the case this is for — that is fine. Reply while an interactive session is live and two processes write to the same conversation.
 
+## Bridging a topic to another agent
+
+A topic does not have to belong to a Claude session. List it in `state/bridges.json` and the listener forwards it somewhere else instead — currently to an [opencode](https://opencode.ai) session, through `bin/opencode-bridge.py`.
+
+```json
+{
+  "6686": {
+    "kind": "opencode",
+    "label": "resources",
+    "session_id": "ses_…",
+    "directory": "/path/to/project",
+    "provider": "openai",
+    "model": "gpt-6.1-sol",
+    "agent": "build"
+  }
+}
+```
+
+Create the topic with `createForumTopic`, add its thread id to the file, and talk to it. The listener re-reads the file per message, so no restart is needed. Bridged topics are checked before any Claude routing, so a message meant for the other agent can never fall through to the newest Claude session.
+
+One bot now speaks for more than one agent, so every answer is prefixed with who wrote it — `CLAUDE_VOICE_LABEL` and `CLAUDE_VOICE_OPENCODE_LABEL`. The label goes on the text and the voice caption, not into the synthesized audio.
+
+> opencode serves two HTTP APIs. The event-sourced `/api/session/{id}/prompt` accepts the message and never runs the turn; the older `POST /session/{id}/message` is synchronous and answers in the response body. The bridge uses the older one on purpose.
+
 ## Swapping drivers
 
 Three stages are separate executables with one-line contracts:
@@ -149,6 +173,7 @@ DeepSeek is dramatically cheaper and faster, but it is a hosted API that sheds l
 ```sh
 tail -f state/worker.log      # outbound: one line per stage, with timing and cost
 tail -f state/listener.log    # inbound: routing decisions
+tail -f state/bridge.log      # inbound: what a bridged topic sent and got back
 ```
 
 ## Status

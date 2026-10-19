@@ -6,6 +6,11 @@ a typed message is used as-is. Either way the text is handed to the session the
 reply belongs to via `claude -p --resume`, and that turn's own Stop hook sends
 the answer back through the outbound pipeline.
 
+A topic listed in `state/bridges.json` goes somewhere else instead: to the
+opencode session bound to it, through bin/opencode-bridge.py. That is what makes
+the group a control room rather than one agent's inbox — Claude in the session
+topics, opencode in the resource topic, the same person reading both.
+
 The result is a closed loop that needs no laptop: listen on AirPods, reply by
 voice, hear the answer.
 
@@ -107,6 +112,44 @@ def read_offset():
 
 def write_offset(value):
     (state_dir() / "listener-offset").write_text(str(value))
+
+
+def bridge_topic(message):
+    """True if this topic is bound to something other than a Claude session.
+
+    Only membership is decided here. What the binding means, and how to talk to
+    it, belongs to bin/opencode-bridge.py — this side just has to know not to
+    hand the message to `claude -p --resume`.
+    """
+    thread_id = message.get("message_thread_id")
+    if thread_id is None:
+        return False
+    path = state_dir() / "bridges.json"
+    if not path.exists():
+        return False
+    try:
+        return str(thread_id) in json.loads(path.read_text())
+    except json.JSONDecodeError:
+        log("bridges.json was unreadable; treating every topic as Claude's")
+        return False
+
+
+def dispatch_bridge(message, text):
+    """Hand the message to the bridge, detached.
+
+    Detached for the same reason resume() is: an opencode turn can run for
+    minutes, and the poll loop has to stay free to carry the next message.
+    """
+    job = json.dumps({"thread_id": message["message_thread_id"],
+                      "text": text}).encode()
+    log(f"bridging topic {message['message_thread_id']}: {text[:60]}")
+    logfile = open(state_dir() / "bridge.log", "a")
+    proc = subprocess.Popen(
+        [str(ROOT / "bin" / "opencode-bridge.py")], stdin=subprocess.PIPE,
+        stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    proc.stdin.write(job)
+    proc.stdin.close()
 
 
 def resolve_by_topic(message):
@@ -266,6 +309,13 @@ def handle(message):
         if text.startswith("/"):
             return  # bot commands are not conversation
     else:
+        return
+
+    # A bridge topic is checked before any Claude routing: a message meant for
+    # opencode must never fall through to the newest Claude session, which is
+    # what resolve_session() does when it cannot place a topic.
+    if bridge_topic(message):
+        dispatch_bridge(message, text)
         return
 
     route = resolve_session(message)

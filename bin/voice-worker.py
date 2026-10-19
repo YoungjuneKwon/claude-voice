@@ -401,6 +401,12 @@ def main():
     # it would only pad what Siri reads out.
     spoken = speech if thread_id else f"{project}. {speech}"
 
+    # One bot speaks for several agents in the control room, so each answer
+    # says who wrote it. See bin/opencode-bridge.py for the other label.
+    label = cfg("CLAUDE_VOICE_LABEL", "[클로드]")
+    if label:
+        spoken = f"{label} {spoken}"
+
     if mode in ("text", "both"):
         # No brackets or markup — Siri reads this string out loud verbatim.
         record_route(deliver_text(spoken, thread_id), payload)
